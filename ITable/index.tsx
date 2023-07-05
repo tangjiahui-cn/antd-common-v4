@@ -1,45 +1,69 @@
 import React, { useEffect, useImperativeHandle, useRef, useState } from 'react';
-import { ActionType, ProFormInstance, ProTableProps, Search } from '@pms/pro-components';
+import { ProFormInstance, Search } from '@pms/pro-components';
 import { useUpdateEffect } from 'react-use';
 import { PmsComponents } from '@pms/console';
-import { IPagination, INIT_PAGINATION, ITableFilter, ITableRequestResult } from './type';
-import { pick } from './utils';
-type ProTableType = ProTableProps<any, any>;
+import {
+  IPagination,
+  INIT_PAGINATION,
+  ITableFilter,
+  ITableRequestResult,
+  pickKeys,
+  SortInfo,
+  AntdProTable,
+  TransformPagination,
+  ProTableType,
+  SortType,
+} from './type';
+import { LOCAL_COLUMN_TRANSFORM, pick } from '@/common/ITable/utils';
+import { cloneDeep } from 'lodash';
+import { hooks } from '@pms/qysmz-react';
 
+export { LOCAL_COLUMN_TRANSFORM } from './utils';
+
+// 组件ref实例类型
 export type TableRef = {
+  // 仅重置筛选项（不触发请求）
   reset: () => void;
+  // 重新刷新当前页 (触发请求)
   reload: (pageIndex?: number) => void;
+  // 重置筛选项与刷新（触发请求）
   resetAndReload: () => void;
+  // 重置分页（触发请求）
+  resetPagination: () => void;
+  // 仅设置分页（触发请求）
   setPagination: (pagination: { current: number; pageSize: number }) => void;
 };
 
-// antd属性直接在组件上使用
-const pickKeys = ['scroll', 'toolBarRender', 'search'];
-
-type AntdProTable = Pick<
-  ProTableType,
-  // 组件上使用部分antdTable的属性的类型提示
-  'scroll' | 'columns' | 'toolBarRender' | 'search'
->;
-
+// 组件类型
 export type ITableProps = {
+  // 是否取消第一次查询
+  isNotFirstRequest?: boolean;
   // 初始筛选项值
   initFilter?: {
     [k: string]: any;
   };
   // 筛选项
   filter?: ITableFilter[];
-  // 默认排序
-  defaultSort?: 'ascend' | 'descend' | 'default';
-  // 默认排序列
-  defaultSortColumnKey?: string;
-  // 启用本地排序的 columnKeys。 （true: 全部本地排序 、false: 全部调用 request、数组：数组内存在的调用本地排序）
-  localSortColumnsKeys?: string[] | boolean;
   // 请求列表的函数
-  request?: (params?: any, sortInfo?: any) => Promise<ITableRequestResult>;
+  request?: (params?: any & IPagination, sortInfo?: SortInfo) => Promise<ITableRequestResult>;
   // 是否显示搜索表单
   search?: false | Search<any, any>;
-  // 使用antd默认属性强制覆盖
+
+  // 默认排序（必须与 defaultSortColumnKey 一起出现）
+  defaultSort?: SortType;
+  // 默认排序列
+  defaultSortColumnKey?: string;
+  // 启用本地排序的 columnKeys （true: 全部本地排序 、false: 全部调用 request、数组：数组内存在的调用本地排序）
+  localSortColumnsKeys?: string[] | boolean;
+  // 本地排序转换函数（默认启用，如果想使用Table组件自带的sort排序属性，请设置为false）
+  // (注：使用此属性，则组件内接管排序而非Table组件。会强制：sort：true，以消除Table组件和当前组件的本地排序逻辑冲突问题)
+  localSortTransform?: (
+    dataSource: any[],
+    sortInfo: SortInfo,
+    pagination: TransformPagination,
+  ) => any[] | false;
+
+  // 使用antdProTable的属性
   extAntdProps?: ProTableType;
 } & AntdProTable;
 
@@ -47,22 +71,29 @@ export type ITableProps = {
  * 封装的ProTable
  *
  * 简单即可使用：关联筛选项、查询列表、排序。
+ * （解决了原有ProTable组件筛选项、排序一起走request属性不好区分本地还是远程的问题，封装后的组件，请求接口的时机与参数是确定的）
  *
  * At 2023.06.15
  * By TangJiaHui
  */
 const ITable = React.forwardRef((props: ITableProps, ref) => {
-  const { columns = [], filter = [], extAntdProps = {} } = props;
+  const {
+    columns = [],
+    filter = [],
+    extAntdProps = {},
+    localSortTransform = LOCAL_COLUMN_TRANSFORM,
+  } = props;
 
   useImperativeHandle(ref, () => ({
     reload,
     reset,
     reloadAndReset,
     setPagination,
+    resetPagination,
   }));
 
   const antdProps = pick(props, pickKeys);
-  const INIT_SORT_INFO = {
+  const INIT_SORT_INFO: SortInfo = {
     columnKey: props?.defaultSortColumnKey,
     order: props?.defaultSort,
   };
@@ -70,19 +101,41 @@ const ITable = React.forwardRef((props: ITableProps, ref) => {
   // 使用 values 触发筛选项的更新（每次手动修改formRef.current，都需要setValues一次）
   const [_, setValues] = useState<any>({});
   const [loading, setLoading] = useState<boolean>(false);
-  const [pagination, setPagination] = useState<IPagination>({ ...INIT_PAGINATION });
+  const [pagination, setPagination, paginationRef] = hooks.useStateWithRef<IPagination>({
+    ...INIT_PAGINATION,
+  });
   const [total, setTotal] = useState<number>(0);
   const [dataSource, setDataSource] = useState<any[]>([]);
-  const [sortInfo, setSortInfo] = useState<any>({ ...INIT_SORT_INFO });
+  const originDataSourceRef = useRef<any[]>([]);
+  const [sortInfo, setSortInfo] = useState<SortInfo>({
+    ...INIT_SORT_INFO,
+  });
   const formRef = useRef<ProFormInstance>();
+
+  // 当前查询本地排序
+  const isLocalSort =
+    props?.localSortColumnsKeys === true ||
+    (sortInfo?.columnKey &&
+      Array.isArray(props?.localSortColumnsKeys) &&
+      props?.localSortColumnsKeys?.includes(sortInfo.columnKey));
+
+  const isDisableLocalSortTransform = (localSortTransform as any) === false;
 
   function formatColumns(columns: any[]) {
     return columns.map((column) =>
-      Object.assign(column, {
-        search: false,
-        sortOrder:
-          sortInfo.columnKey === (column?.dataIndex || column?.key) ? sortInfo.order : null,
-      }),
+      Object.assign(
+        column,
+        {
+          search: false,
+          sortOrder:
+            sortInfo.columnKey === (column?.dataIndex || column?.key) ? sortInfo.order : null,
+        },
+        column?.sorter
+          ? {
+              sorter: isDisableLocalSortTransform ? column?.sorter : true,
+            }
+          : {},
+      ),
     );
   }
 
@@ -104,6 +157,32 @@ const ITable = React.forwardRef((props: ITableProps, ref) => {
     setValues(filter); // 触发筛选项更新（如果未）
   }
 
+  function getPaginationInfo(pagination: IPagination): TransformPagination {
+    const pageStartIndex = (pagination.current - 1) * pagination.pageSize;
+    return {
+      ...pagination,
+      pageStartIndex,
+      pageEndIndex: pageStartIndex + pagination.pageSize,
+    };
+  }
+
+  function handleLocalSort(dataSource: any[], sortInfo: SortInfo) {
+    const _sortInfo: SortInfo = {
+      ...sortInfo,
+      order: sortInfo.order || 'default',
+    };
+
+    // 进行dataSource转换
+    localSortTransform &&
+      setDataSource(
+        localSortTransform?.(
+          cloneDeep(dataSource),
+          _sortInfo,
+          getPaginationInfo(paginationRef.current as any),
+        ) || [],
+      );
+  }
+
   function query() {
     const params = {
       ...formRef.current?.getFieldsValue(),
@@ -113,6 +192,14 @@ const ITable = React.forwardRef((props: ITableProps, ref) => {
     setLoading(true);
     props?.request?.(params, sortInfo)?.then((res: ITableRequestResult) => {
       setDataSource(res.data);
+      originDataSourceRef.current = cloneDeep(res?.data);
+
+      // 只要是本地排序，都在每次查询接口时调用一次转换函数
+      // （远程排序，已经在request函数中传过去参数了）
+      if (isLocalSort) {
+        handleLocalSort(cloneDeep(originDataSourceRef.current), sortInfo);
+      }
+
       setTotal(res.total);
       setLoading(false);
     });
@@ -141,6 +228,11 @@ const ITable = React.forwardRef((props: ITableProps, ref) => {
     setPagination({ ...INIT_PAGINATION });
   }
 
+  // 仅仅重置分页
+  function resetPagination() {
+    setPagination({ ...INIT_PAGINATION });
+  }
+
   // 利用分页触发列表请求查询
   useUpdateEffect(() => {
     query?.();
@@ -150,14 +242,17 @@ const ITable = React.forwardRef((props: ITableProps, ref) => {
     if (props?.initFilter && typeof props?.initFilter === 'object') {
       formRef.current?.setFieldsValue(props?.initFilter);
     }
-    setPagination({ ...pagination });
+
+    if (!props?.isNotFirstRequest) {
+      setPagination({ ...pagination });
+    }
   }, []);
 
   return (
     <PmsComponents.Table
       loading={loading}
       form={{
-        initialValues: props?.initFilter
+        initialValues: props?.initFilter,
       }}
       dataSource={dataSource}
       formRef={formRef}
@@ -174,8 +269,11 @@ const ITable = React.forwardRef((props: ITableProps, ref) => {
               : true;
 
           setSortInfo(sortInfo);
-
-          if (!isLocalSort) {
+          if (isLocalSort) {
+            // 本地排序
+            handleLocalSort(cloneDeep(originDataSourceRef.current), sortInfo);
+          } else {
+            // 远程请求接口
             setPagination({ ...pagination });
           }
         }
